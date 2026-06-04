@@ -6,6 +6,11 @@ const Question = require("../models/Question");
 const Topic = require("../models/Topic");
 const User = require("../models/User");
 const { protect, adminOnly } = require("../middleware/auth");
+const {
+  getUserDepartment,
+  getScopedCourseQuery,
+  sendScopeError,
+} = require("../middleware/departmentScope");
 
 const attachQuestionCounts = async (courses) => {
   const normalizedCourses = Array.isArray(courses) ? courses : [courses];
@@ -49,8 +54,8 @@ const attachQuestionCounts = async (courses) => {
 // @access  Private/Admin
 router.post("/", protect, adminOnly, async (req, res) => {
   try {
-    const { name, code, description, department, semester, academicYear } =
-      req.body;
+    const { name, code, description, semester, academicYear } = req.body;
+    const department = getUserDepartment(req);
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({
@@ -66,15 +71,17 @@ router.post("/", protect, adminOnly, async (req, res) => {
       });
     }
 
-    if (!department || !String(department).trim()) {
+    if (!department) {
       return res.status(400).json({
         success: false,
-        message: "Department is required",
+        message: "Your account is not assigned to a department",
       });
     }
 
     const normalizedCode = String(code).trim().toUpperCase();
-    const existingCourse = await Course.findOne({ code: normalizedCode });
+    const existingCourse = await Course.findOne(
+      getScopedCourseQuery(req, { code: normalizedCode }),
+    );
 
     if (existingCourse && existingCourse.isActive) {
       return res.status(409).json({
@@ -89,7 +96,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
       existingCourse.name = String(name).trim();
       existingCourse.code = normalizedCode;
       existingCourse.description = description;
-      existingCourse.department = String(department).trim();
+      existingCourse.department = department;
       existingCourse.semester = semester || existingCourse.semester;
       existingCourse.academicYear = academicYear;
       existingCourse.lecturer = req.user._id;
@@ -100,7 +107,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
         name: String(name).trim(),
         code: normalizedCode,
         description,
-        department: String(department).trim(),
+        department,
         semester,
         academicYear,
         lecturer: req.user._id,
@@ -123,12 +130,19 @@ router.post("/", protect, adminOnly, async (req, res) => {
       data: hydratedCourse,
     });
   } catch (error) {
-    const statusCode = error.name === "ValidationError" ? 400 : 500;
+    const statusCode =
+      error.name === "ValidationError" || error.code === 11000 ? 400 : 500;
 
     res.status(statusCode).json({
       success: false,
-      message: "Error creating course",
-      error: error.message,
+      message:
+        error.code === 11000
+          ? "A course with this code already exists in this department"
+          : "Error creating course",
+      error:
+        error.code === 11000
+          ? "A course with this code already exists in this department"
+          : error.message,
     });
   }
 });
@@ -138,7 +152,9 @@ router.post("/", protect, adminOnly, async (req, res) => {
 // @access  Private
 router.get("/", protect, async (req, res) => {
   try {
-    const courses = await Course.find({ isActive: true })
+    const courses = await Course.find(
+      getScopedCourseQuery(req, { isActive: true }),
+    )
       .populate("lecturer", "name email")
       .sort({ code: 1, name: 1 });
 
@@ -149,11 +165,7 @@ router.get("/", protect, async (req, res) => {
       data: hydratedCourses,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching courses",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching courses");
   }
 });
 
@@ -162,12 +174,14 @@ router.get("/", protect, async (req, res) => {
 // @access  Private
 router.get("/:id", protect, async (req, res) => {
   try {
-    const course = await Course.findById(req.params.id).populate(
-      "lecturer",
-      "name email",
-    );
+    const course = await Course.findOne(
+      getScopedCourseQuery(req, {
+        _id: req.params.id,
+        isActive: true,
+      }),
+    ).populate("lecturer", "name email");
 
-    if (!course || !course.isActive) {
+    if (!course) {
       return res.status(404).json({
         success: false,
         message: "Course not found",
@@ -181,11 +195,7 @@ router.get("/:id", protect, async (req, res) => {
       data: hydratedCourse,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching course",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching course");
   }
 });
 
@@ -194,9 +204,14 @@ router.get("/:id", protect, async (req, res) => {
 // @access  Private/Admin
 router.delete("/:id", protect, adminOnly, async (req, res) => {
   try {
-    const course = await Course.findById(req.params.id);
+    const course = await Course.findOne(
+      getScopedCourseQuery(req, {
+        _id: req.params.id,
+        isActive: true,
+      }),
+    );
 
-    if (!course || !course.isActive) {
+    if (!course) {
       return res.status(404).json({
         success: false,
         message: "Course not found",
@@ -237,11 +252,7 @@ router.delete("/:id", protect, adminOnly, async (req, res) => {
       message: "Course deleted successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error deleting course",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error deleting course");
   }
 });
 

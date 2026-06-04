@@ -1,7 +1,33 @@
 const express = require("express");
 const router = express.Router();
 const Question = require("../models/Question");
+const Topic = require("../models/Topic");
 const { protect, adminOnly } = require("../middleware/auth");
+const {
+  getDepartmentCourseIds,
+  requireDepartmentCourse,
+  sendScopeError,
+} = require("../middleware/departmentScope");
+
+const requireTopicForCourse = async (topicId, courseId) => {
+  if (!topicId) {
+    return null;
+  }
+
+  const topic = await Topic.findOne({
+    _id: topicId,
+    course: courseId,
+    isActive: true,
+  });
+
+  if (!topic) {
+    const error = new Error("Topic not found for selected course");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  return topic;
+};
 
 // @route   GET /api/questions
 // @desc    Get all questions with filters
@@ -16,10 +42,10 @@ router.get("/", protect, async (req, res) => {
       limit = 50,
       page = 1,
     } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const query = { isActive: true };
+    const query = { isActive: true, course: { $in: courseIds } };
 
-    if (course) query.course = course;
     if (topic) query.topic = topic;
     if (difficulty) query.difficulty = difficulty;
     if (questionType) query.questionType = questionType;
@@ -46,11 +72,7 @@ router.get("/", protect, async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching questions",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching questions");
   }
 });
 
@@ -60,9 +82,13 @@ router.get("/", protect, async (req, res) => {
 router.get("/predicted", protect, async (req, res) => {
   try {
     const { course, limit = 20 } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const query = { isActive: true, predictedProbability: { $gt: 0 } };
-    if (course) query.course = course;
+    const query = {
+      isActive: true,
+      predictedProbability: { $gt: 0 },
+      course: { $in: courseIds },
+    };
 
     const questions = await Question.find(query)
       .populate("course", "name code")
@@ -75,11 +101,7 @@ router.get("/predicted", protect, async (req, res) => {
       data: questions,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching predicted questions",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching predicted questions");
   }
 });
 
@@ -88,7 +110,12 @@ router.get("/predicted", protect, async (req, res) => {
 // @access  Private
 router.get("/:id", protect, async (req, res) => {
   try {
-    const question = await Question.findById(req.params.id)
+    const courseIds = await getDepartmentCourseIds(req);
+    const question = await Question.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
+    })
       .populate("course", "name code")
       .populate("topic", "name lecturerEmphasis")
       .populate("uploadedBy", "name");
@@ -105,11 +132,7 @@ router.get("/:id", protect, async (req, res) => {
       data: question,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching question",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching question");
   }
 });
 
@@ -118,8 +141,12 @@ router.get("/:id", protect, async (req, res) => {
 // @access  Private/Admin
 router.post("/", protect, adminOnly, async (req, res) => {
   try {
+    const course = await requireDepartmentCourse(req, req.body.course);
+    await requireTopicForCourse(req.body.topic, course._id);
+
     const questionData = {
       ...req.body,
+      course: course._id,
       uploadedBy: req.user._id,
     };
 
@@ -130,7 +157,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
       data: question,
     });
   } catch (error) {
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       message: "Error creating question",
       error: error.message,
@@ -143,9 +170,11 @@ router.post("/", protect, adminOnly, async (req, res) => {
 // @access  Private/Admin
 router.put("/:id", protect, adminOnly, async (req, res) => {
   try {
-    const question = await Question.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-      runValidators: true,
+    const courseIds = await getDepartmentCourseIds(req);
+    const question = await Question.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
     });
 
     if (!question) {
@@ -155,16 +184,24 @@ router.put("/:id", protect, adminOnly, async (req, res) => {
       });
     }
 
+    const nextCourseId = req.body.course || question.course;
+    const nextCourse = await requireDepartmentCourse(req, nextCourseId);
+    const nextTopicId =
+      req.body.topic !== undefined ? req.body.topic : question.topic;
+    await requireTopicForCourse(nextTopicId, nextCourse._id);
+
+    Object.assign(question, {
+      ...req.body,
+      course: nextCourse._id,
+    });
+    await question.save();
+
     res.json({
       success: true,
       data: question,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error updating question",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error updating question");
   }
 });
 
@@ -173,11 +210,12 @@ router.put("/:id", protect, adminOnly, async (req, res) => {
 // @access  Private/Admin
 router.delete("/:id", protect, adminOnly, async (req, res) => {
   try {
-    const question = await Question.findByIdAndUpdate(
-      req.params.id,
-      { isActive: false },
-      { new: true },
-    );
+    const courseIds = await getDepartmentCourseIds(req);
+    const question = await Question.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
+    });
 
     if (!question) {
       return res.status(404).json({
@@ -186,16 +224,15 @@ router.delete("/:id", protect, adminOnly, async (req, res) => {
       });
     }
 
+    question.isActive = false;
+    await question.save();
+
     res.json({
       success: true,
       message: "Question deleted successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error deleting question",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error deleting question");
   }
 });
 
@@ -205,8 +242,8 @@ router.delete("/:id", protect, adminOnly, async (req, res) => {
 router.get("/stats/overview", protect, async (req, res) => {
   try {
     const { course } = req.query;
-    const matchQuery = { isActive: true };
-    if (course) matchQuery.course = course;
+    const courseIds = await getDepartmentCourseIds(req, course);
+    const matchQuery = { isActive: true, course: { $in: courseIds } };
 
     const stats = await Question.aggregate([
       { $match: matchQuery },
@@ -230,11 +267,7 @@ router.get("/stats/overview", protect, async (req, res) => {
       data: stats[0] || { totalQuestions: 0, avgProbability: 0 },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching statistics",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching statistics");
   }
 });
 

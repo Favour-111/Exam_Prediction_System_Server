@@ -10,7 +10,6 @@ const courseSchema = new mongoose.Schema(
     code: {
       type: String,
       required: [true, "Course code is required"],
-      unique: true,
       uppercase: true,
       trim: true,
     },
@@ -63,6 +62,9 @@ const courseSchema = new mongoose.Schema(
     toObject: { virtuals: true },
   },
 );
+
+courseSchema.index({ department: 1, code: 1 }, { unique: true });
+courseSchema.index({ department: 1, isActive: 1 });
 
 courseSchema.virtual("questions", {
   ref: "Question",

@@ -12,6 +12,10 @@ const Question = require("../models/Question");
 const Topic = require("../models/Topic");
 const { protect, adminOnly } = require("../middleware/auth");
 const mongoose = require("mongoose");
+const {
+  getScopedCourseQuery,
+  requireDepartmentCourse,
+} = require("../middleware/departmentScope");
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -146,19 +150,19 @@ async function extractTextFromFile(file) {
   throw new Error(`Unsupported file type: ${file.mimetype}`);
 }
 
-async function resolveCourse(courseValue) {
+async function resolveCourse(req, courseValue) {
   if (!courseValue) {
     throw new Error("Course is required");
   }
 
   const course = mongoose.Types.ObjectId.isValid(courseValue)
-    ? await Course.findById(courseValue)
+    ? await requireDepartmentCourse(req, courseValue)
     : await Course.findOne({
+        ...getScopedCourseQuery(req, { isActive: true }),
         $or: [
           { code: String(courseValue).trim().toUpperCase() },
           { name: new RegExp(`^${String(courseValue).trim()}$`, "i") },
         ],
-        isActive: true,
       });
 
   if (!course) {
@@ -620,7 +624,7 @@ router.post(
         });
       }
 
-      const resolvedCourse = await resolveCourse(course);
+      const resolvedCourse = await resolveCourse(req, course);
 
       let resolvedLecturerNote = String(lecturerNote || "").trim();
 
@@ -822,17 +826,16 @@ router.post(
       });
     } catch (error) {
       console.error("Upload error:", error);
-      const statusCode =
+      const isValidationError =
         error.name === "ValidationError" ||
         error.message === "Course is required" ||
-        error.message === "Selected course was not found"
-          ? 400
-          : 500;
+        error.message === "Selected course was not found";
+      const statusCode = error.statusCode || (isValidationError ? 400 : 500);
 
       res.status(statusCode).json({
         success: false,
         message:
-          statusCode === 400 ? error.message : "Error processing uploaded file",
+          statusCode < 500 ? error.message : "Error processing uploaded file",
         error: error.message,
       });
     }
@@ -855,9 +858,13 @@ router.post("/bulk-questions", protect, adminOnly, async (req, res) => {
 
     const savedQuestions = [];
     for (const q of questions) {
+      const resolvedCourse = await requireDepartmentCourse(
+        req,
+        q.course || course,
+      );
       const question = await Question.create({
         text: q.text,
-        course: q.course || course,
+        course: resolvedCourse._id,
         topic: q.topic,
         difficulty: q.difficulty || "Medium",
         questionType: q.questionType || "Theory",
@@ -879,7 +886,7 @@ router.post("/bulk-questions", protect, adminOnly, async (req, res) => {
       data: savedQuestions,
     });
   } catch (error) {
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       message: "Error uploading questions",
       error: error.message,
@@ -902,11 +909,12 @@ router.post("/topics", protect, adminOnly, async (req, res) => {
     }
 
     const savedTopics = [];
+    const resolvedCourse = await requireDepartmentCourse(req, course);
     for (const t of topics) {
       const topic = await Topic.create({
         name: t.name,
         description: t.description,
-        course,
+        course: resolvedCourse._id,
         lecturerEmphasis: t.lecturerEmphasis || 5,
         keywords: t.keywords || [],
         subtopics: t.subtopics || [],
@@ -920,7 +928,7 @@ router.post("/topics", protect, adminOnly, async (req, res) => {
       data: savedTopics,
     });
   } catch (error) {
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       message: "Error creating topics",
       error: error.message,

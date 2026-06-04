@@ -2,11 +2,15 @@ const express = require("express");
 const router = express.Router();
 const axios = require("axios");
 const mongoose = require("mongoose");
-const Course = require("../models/Course");
 const Prediction = require("../models/Prediction");
 const Question = require("../models/Question");
 const Topic = require("../models/Topic");
 const { protect, adminOnly } = require("../middleware/auth");
+const {
+  getDepartmentCourseIds,
+  requireDepartmentCourse,
+  sendScopeError,
+} = require("../middleware/departmentScope");
 
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -559,9 +563,9 @@ function buildFallbackPredictions(studyAreas, courseQuestions) {
 router.get("/", protect, async (req, res) => {
   try {
     const { course, limit = 10 } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const query = {};
-    if (course) query.course = course;
+    const query = { course: { $in: courseIds } };
 
     const predictions = await Prediction.find(query)
       .populate("course", "name code")
@@ -575,11 +579,7 @@ router.get("/", protect, async (req, res) => {
       data: predictions,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching predictions",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching predictions");
   }
 });
 
@@ -597,7 +597,12 @@ router.get("/latest", protect, async (req, res) => {
       });
     }
 
-    const prediction = await Prediction.findOne({ course, status: "completed" })
+    const scopedCourse = await requireDepartmentCourse(req, course);
+
+    const prediction = await Prediction.findOne({
+      course: scopedCourse._id,
+      status: "completed",
+    })
       .populate("course", "name code")
       .populate("topicPredictions.topic", "name lecturerEmphasis")
       .populate("questionPredictions.question", "text difficulty questionType")
@@ -616,11 +621,7 @@ router.get("/latest", protect, async (req, res) => {
       data: prediction,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching latest prediction",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching latest prediction");
   }
 });
 
@@ -630,9 +631,10 @@ router.get("/latest", protect, async (req, res) => {
 router.get("/topics-probability", protect, async (req, res) => {
   try {
     const { course } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
     const topics = await Topic.find({
-      course,
+      course: { $in: courseIds },
       isActive: true,
     }).sort({ predictedProbability: -1 });
 
@@ -649,11 +651,7 @@ router.get("/topics-probability", protect, async (req, res) => {
       data: chartData,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching topic probabilities",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching topic probabilities");
   }
 });
 
@@ -663,15 +661,13 @@ router.get("/topics-probability", protect, async (req, res) => {
 router.post("/train-model", protect, adminOnly, async (req, res) => {
   try {
     const { course } = req.body;
-    const courseRecord = await Course.findById(course).select(
-      "lecturerNotes noteKeywords",
-    );
+    const courseRecord = await requireDepartmentCourse(req, course);
 
     // Get all questions for training
-    const questions = await Question.find({ course, isActive: true }).populate(
-      "topic",
-      "name lecturerEmphasis",
-    );
+    const questions = await Question.find({
+      course: courseRecord._id,
+      isActive: true,
+    }).populate("topic", "name lecturerEmphasis");
     const studyAreas = buildStudyAreas(
       questions,
       courseRecord?.lecturerNotes || "",
@@ -679,7 +675,7 @@ router.post("/train-model", protect, adminOnly, async (req, res) => {
 
     // Prepare training data
     const trainingData = {
-      course_id: course,
+      course_id: String(courseRecord._id),
       questions: questions.map((q) => ({
         text: q.text,
         topic: getStudyAreaName(q),
@@ -713,11 +709,7 @@ router.post("/train-model", protect, adminOnly, async (req, res) => {
     });
   } catch (error) {
     console.error("Training error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error training model",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error training model");
   }
 });
 
@@ -735,22 +727,20 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
       });
     }
 
-    const courseRecord = await Course.findById(course).select(
-      "name lecturerNotes noteKeywords",
-    );
+    const courseRecord = await requireDepartmentCourse(req, course);
 
     // Create pending prediction record
     const prediction = await Prediction.create({
-      course,
+      course: courseRecord._id,
       status: "pending",
       generatedBy: req.user._id,
     });
 
     // Get all questions for the course, grouped with year info
-    const questions = await Question.find({ course, isActive: true }).populate(
-      "topic",
-      "name lecturerEmphasis lecturerNotes",
-    );
+    const questions = await Question.find({
+      course: courseRecord._id,
+      isActive: true,
+    }).populate("topic", "name lecturerEmphasis lecturerNotes");
     const studyAreas = buildStudyAreas(
       questions,
       courseRecord?.lecturerNotes || "",
@@ -788,7 +778,7 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
 
     try {
       const predictionData = {
-        course_id: course,
+        course_id: String(courseRecord._id),
         questions: questions.map((q) => ({
           id: q._id.toString(),
           text: q.text,
@@ -851,7 +841,7 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
       for (const qp of predictions.question_predictions) {
         await Question.findByIdAndUpdate(qp.question_id, {
           predictedProbability: qp.probability,
-        });
+        }).where("course").equals(courseRecord._id);
       }
     }
 
@@ -941,11 +931,7 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
     });
   } catch (error) {
     console.error("Prediction error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error generating predictions",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error generating predictions");
   }
 });
 
@@ -954,7 +940,11 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
 // @access  Private
 router.get("/:id", protect, async (req, res) => {
   try {
-    const prediction = await Prediction.findById(req.params.id)
+    const courseIds = await getDepartmentCourseIds(req);
+    const prediction = await Prediction.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+    })
       .populate("course", "name code")
       .populate("topicPredictions.topic", "name lecturerEmphasis")
       .populate("questionPredictions.question", "text difficulty questionType")
@@ -972,11 +962,7 @@ router.get("/:id", protect, async (req, res) => {
       data: prediction,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching prediction",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching prediction");
   }
 });
 
@@ -1002,13 +988,7 @@ router.post("/generate-from-text", protect, adminOnly, async (req, res) => {
         });
     }
 
-    const courseRecord =
-      await Course.findById(course).select("name lecturerNotes");
-    if (!courseRecord) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Course not found" });
-    }
+    const courseRecord = await requireDepartmentCourse(req, course);
 
     // Merge any passed lecturer notes with stored ones
     const combinedNotes = [
@@ -1146,7 +1126,7 @@ Return ONLY this JSON (no markdown, no explanations outside JSON):
 
     // Persist to DB as a new prediction record
     const prediction = await Prediction.create({
-      course,
+      course: courseRecord._id,
       status: "completed",
       generatedBy: req.user._id,
       modelVersion: "groq-from-text-v1",
@@ -1178,6 +1158,14 @@ Return ONLY this JSON (no markdown, no explanations outside JSON):
     });
   } catch (error) {
     console.error("generate-from-text error:", error.message);
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+        error: error.message,
+      });
+    }
+
     return res.status(500).json({
       success: false,
       message:

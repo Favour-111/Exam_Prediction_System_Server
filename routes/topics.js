@@ -3,6 +3,11 @@ const router = express.Router();
 const Topic = require("../models/Topic");
 const Course = require("../models/Course");
 const { protect, adminOnly } = require("../middleware/auth");
+const {
+  getDepartmentCourseIds,
+  requireDepartmentCourse,
+  sendScopeError,
+} = require("../middleware/departmentScope");
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -12,9 +17,9 @@ const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 router.get("/", protect, async (req, res) => {
   try {
     const { course, sortBy = "predictedProbability" } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const query = { isActive: true };
-    if (course) query.course = course;
+    const query = { isActive: true, course: { $in: courseIds } };
 
     const sortOptions = {};
     sortOptions[sortBy] = -1;
@@ -28,11 +33,7 @@ router.get("/", protect, async (req, res) => {
       data: topics,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching topics",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching topics");
   }
 });
 
@@ -42,9 +43,9 @@ router.get("/", protect, async (req, res) => {
 router.get("/probability", protect, async (req, res) => {
   try {
     const { course, limit = 10 } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const query = { isActive: true };
-    if (course) query.course = course;
+    const query = { isActive: true, course: { $in: courseIds } };
 
     const topics = await Topic.find(query)
       .populate("course", "name code")
@@ -62,11 +63,7 @@ router.get("/probability", protect, async (req, res) => {
       data: topicsWithPercentage,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching topic probabilities",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching topic probabilities");
   }
 });
 
@@ -75,7 +72,12 @@ router.get("/probability", protect, async (req, res) => {
 // @access  Private
 router.get("/:id", protect, async (req, res) => {
   try {
-    const topic = await Topic.findById(req.params.id).populate(
+    const courseIds = await getDepartmentCourseIds(req);
+    const topic = await Topic.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
+    }).populate(
       "course",
       "name code",
     );
@@ -92,11 +94,7 @@ router.get("/:id", protect, async (req, res) => {
       data: topic,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching topic",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching topic");
   }
 });
 
@@ -129,10 +127,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
       });
     }
 
-    const existingCourse = await Course.findOne({
-      _id: course,
-      isActive: true,
-    });
+    const existingCourse = await requireDepartmentCourse(req, course);
 
     if (!existingCourse) {
       return res.status(404).json({
@@ -144,7 +139,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
     const normalizedName = String(name).trim();
 
     const existingTopic = await Topic.findOne({
-      course,
+      course: existingCourse._id,
       name: new RegExp(`^${escapeRegExp(normalizedName)}$`, "i"),
     });
 
@@ -173,7 +168,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
       topic = await Topic.create({
         name: normalizedName,
         description,
-        course,
+        course: existingCourse._id,
         lecturerEmphasis,
         lecturerNotes,
         keywords,
@@ -182,7 +177,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
     }
 
     // Add topic to course
-    await Course.findByIdAndUpdate(course, {
+    await Course.findByIdAndUpdate(existingCourse._id, {
       $addToSet: { topics: topic._id },
     });
 
@@ -193,9 +188,9 @@ router.post("/", protect, adminOnly, async (req, res) => {
   } catch (error) {
     const statusCode = error.name === "ValidationError" ? 400 : 500;
 
-    res.status(statusCode).json({
+    res.status(error.statusCode || statusCode).json({
       success: false,
-      message: "Error creating topic",
+      message: error.statusCode ? error.message : "Error creating topic",
       error: error.message,
     });
   }
@@ -206,9 +201,11 @@ router.post("/", protect, adminOnly, async (req, res) => {
 // @access  Private/Admin
 router.put("/:id", protect, adminOnly, async (req, res) => {
   try {
-    const topic = await Topic.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-      runValidators: true,
+    const courseIds = await getDepartmentCourseIds(req);
+    const topic = await Topic.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
     });
 
     if (!topic) {
@@ -218,16 +215,19 @@ router.put("/:id", protect, adminOnly, async (req, res) => {
       });
     }
 
+    if (req.body.course) {
+      await requireDepartmentCourse(req, req.body.course);
+    }
+
+    Object.assign(topic, req.body);
+    await topic.save();
+
     res.json({
       success: true,
       data: topic,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error updating topic",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error updating topic");
   }
 });
 
@@ -245,11 +245,12 @@ router.put("/:id/emphasis", protect, adminOnly, async (req, res) => {
       });
     }
 
-    const topic = await Topic.findByIdAndUpdate(
-      req.params.id,
-      { lecturerEmphasis },
-      { new: true },
-    );
+    const courseIds = await getDepartmentCourseIds(req);
+    const topic = await Topic.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
+    });
 
     if (!topic) {
       return res.status(404).json({
@@ -258,16 +259,15 @@ router.put("/:id/emphasis", protect, adminOnly, async (req, res) => {
       });
     }
 
+    topic.lecturerEmphasis = lecturerEmphasis;
+    await topic.save();
+
     res.json({
       success: true,
       data: topic,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error updating topic emphasis",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error updating topic emphasis");
   }
 });
 
@@ -276,11 +276,12 @@ router.put("/:id/emphasis", protect, adminOnly, async (req, res) => {
 // @access  Private/Admin
 router.delete("/:id", protect, adminOnly, async (req, res) => {
   try {
-    const topic = await Topic.findByIdAndUpdate(
-      req.params.id,
-      { isActive: false },
-      { new: true },
-    );
+    const courseIds = await getDepartmentCourseIds(req);
+    const topic = await Topic.findOne({
+      _id: req.params.id,
+      course: { $in: courseIds },
+      isActive: true,
+    });
 
     if (!topic) {
       return res.status(404).json({
@@ -289,16 +290,15 @@ router.delete("/:id", protect, adminOnly, async (req, res) => {
       });
     }
 
+    topic.isActive = false;
+    await topic.save();
+
     res.json({
       success: true,
       message: "Topic deleted successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error deleting topic",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error deleting topic");
   }
 });
 
@@ -308,9 +308,9 @@ router.delete("/:id", protect, adminOnly, async (req, res) => {
 router.get("/stats/distribution", protect, async (req, res) => {
   try {
     const { course } = req.query;
+    const courseIds = await getDepartmentCourseIds(req, course);
 
-    const matchQuery = { isActive: true };
-    if (course) matchQuery.course = course;
+    const matchQuery = { isActive: true, course: { $in: courseIds } };
 
     const distribution = await Topic.aggregate([
       { $match: matchQuery },
@@ -344,11 +344,7 @@ router.get("/stats/distribution", protect, async (req, res) => {
       data: distribution,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error fetching distribution",
-      error: error.message,
-    });
+    sendScopeError(res, error, "Error fetching distribution");
   }
 });
 

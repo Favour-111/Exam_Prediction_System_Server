@@ -3,6 +3,7 @@ const router = express.Router();
 const User = require("../models/User");
 const { generateToken, protect } = require("../middleware/auth");
 const { body, validationResult } = require("express-validator");
+const { getDepartmentFilter } = require("../middleware/departmentScope");
 
 // @route   POST /api/auth/register
 // @desc    Register a new user
@@ -21,6 +22,10 @@ router.post(
       .toLowerCase()
       .isIn(["student", "admin", "lecturer"])
       .withMessage("Role must be student, lecturer, or admin"),
+    body("department")
+      .trim()
+      .notEmpty()
+      .withMessage("Department is required"),
   ],
   async (req, res) => {
     try {
@@ -53,7 +58,7 @@ router.post(
         email,
         password,
         role: normalizedRole,
-        department,
+        department: String(department).trim(),
       });
 
       // Generate token
@@ -155,13 +160,19 @@ router.post(
 // @access  Private
 router.get("/me", protect, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).populate("courses");
+    const user = await User.findById(req.user._id).populate({
+      path: "courses",
+      match: {
+        department: getDepartmentFilter(req),
+        isActive: true,
+      },
+    });
     res.json({
       success: true,
       data: user,
     });
   } catch (error) {
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
       message: "Error fetching user",
       error: error.message,
@@ -174,11 +185,11 @@ router.get("/me", protect, async (req, res) => {
 // @access  Private
 router.put("/profile", protect, async (req, res) => {
   try {
-    const { name, department, avatar } = req.body;
+    const { name, avatar } = req.body;
 
     const user = await User.findByIdAndUpdate(
       req.user._id,
-      { name, department, avatar },
+      { name, avatar },
       { new: true, runValidators: true },
     );
 
