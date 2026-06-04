@@ -62,6 +62,7 @@ const predictionSchema = new mongoose.Schema(
         questionType: String,
         difficulty: String,
         rationale: String,
+        sourceQuestion: String,
         probability: {
           type: Number,
           min: 0,
@@ -89,6 +90,7 @@ const predictionSchema = new mongoose.Schema(
         question: String,
         probability: Number, // 0-100
         reasoning: String,
+        sourceQuestion: String, // the original past question this was reformulated from
         appearedInYears: [String],
         topic: String,
         questionType: String,

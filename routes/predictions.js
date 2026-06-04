@@ -40,7 +40,7 @@ async function generateQuestionsWithGroq(questions, lecturerNotes, courseName) {
     : "";
 
   const systemPrompt =
-    "You are an expert university exam prediction AI. Analyze past exam questions across multiple years, find patterns and recurring topics, then predict the most likely questions for the upcoming exam. Return only valid JSON.";
+    "You are an expert university exam prediction AI. Your job is to study past exam questions carefully and generate NEW predicted questions that are close reformulations of the most frequently recurring past questions. Do NOT copy questions verbatim — reword them while keeping the same concept, topic, and difficulty. Return only valid JSON.";
 
   const userPrompt = `Course: ${courseName || "This Course"}
 
@@ -49,17 +49,24 @@ I am providing ${questions.length} past exam questions from ${sortedYears.length
 ${yearSections}${noteSection}
 
 TASK:
-1. Compare all questions across every year.
-2. Identify which topics, concepts, and question styles repeat across years.
-3. Spot trends — topics that are becoming more frequent in recent years.
-4. Use the lecturer notes as extra weight when they match recurring topics.
-5. Generate 10–15 predicted questions for the upcoming exam.
+1. Read all past questions carefully across every year.
+2. Find questions that REPEAT across multiple years — these are the highest priority.
+3. Find questions that appeared in the MOST RECENT year — second priority.
+4. Find topics heavily mentioned in the lecturer notes — third priority.
+5. Generate 10–15 NEW predicted questions for the upcoming exam by REFORMULATING the highest-priority past questions.
+
+REFORMULATION RULES (very important):
+- Do NOT copy the past question word-for-word.
+- Reword it: change the opening verb, rephrase the structure, but keep the EXACT same concept and topic.
+- Example: past question "Explain the OSI model and its 7 layers" → predicted question "Describe the OSI reference model. With clear examples, outline the function of each of its layers."
+- Keep the same difficulty and question type as the original.
+- Each generated question must feel like a fresh exam question, not a copy.
 
 Assign each predicted question a probability (0–100) based on:
-- How many years the topic appeared (more years = higher probability)
-- Whether the question or a near-identical version recurred verbatim
-- Whether it appeared in the most recent year (recency bonus)
-- Whether the lecturer notes mention the topic
+- 85–100%: The same concept/question appeared in 3+ years OR appeared verbatim in the most recent year
+- 70–84%: Appeared in exactly 2 years OR appeared in the most recent year + mentioned in lecturer notes
+- 50–69%: Appeared once AND is mentioned in lecturer notes
+- 30–49%: Appeared once, no note support
 
 Return ONLY this JSON (no markdown, no extra text):
 {
@@ -74,9 +81,10 @@ Return ONLY this JSON (no markdown, no extra text):
   },
   "predictedQuestions": [
     {
-      "question": "Full question text here?",
+      "question": "Full NEW reformulated question text here?",
       "probability": 85,
-      "reasoning": "This exact question appeared in 2020 and 2021 and is mentioned in the lecturer notes.",
+      "reasoning": "This concept appeared in 2020 and 2021. Reformulated from: 'original past question text here'.",
+      "sourceQuestion": "The exact or near-exact past question this is based on",
       "appearedInYears": ["2020", "2021"],
       "topic": "Topic Name",
       "questionType": "Theory",
@@ -269,111 +277,127 @@ function deriveNoteFocus(lecturerNotes = "") {
     : "core concepts and practical applications";
 }
 
+// Reformulation starters indexed by intent — deterministic, no Math.random
+const REFORMULATION_STARTERS = {
+  theory: [
+    (core) => `Explain ${core}`,
+    (core) => `Describe ${core}`,
+    (core) => `Discuss ${core}`,
+    (core) => `With the aid of examples, explain ${core}`,
+    (core) => `Outline the key concepts of ${core}`,
+  ],
+  compare: [
+    (core) => `Compare and contrast ${core}`,
+    (core) => `Differentiate between ${core}`,
+    (core) => `Distinguish between ${core}`,
+    (core) => `Highlight the similarities and differences in ${core}`,
+  ],
+  practical: [
+    (core) => `Design ${core}`,
+    (core) => `Implement ${core}`,
+    (core) => `With a clear diagram, illustrate ${core}`,
+    (core) => `Develop a solution for ${core}`,
+  ],
+  calculation: [
+    (core) => `Calculate ${core}`,
+    (core) => `Determine ${core}`,
+    (core) => `Evaluate ${core}`,
+    (core) => `Solve the following: ${core}`,
+  ],
+};
+
+function reformulateQuestion(text = "", index = 0) {
+  // Strip leading numbering like "1.", "a)", "Q2." etc.
+  const cleaned = text
+    .trim()
+    .replace(/^[\d]+[.)]\s*|^[a-zA-Z][.)]\s*|^Q\d+[.)\s]+/i, "")
+    .trim();
+
+  if (!cleaned || cleaned.length < 10) return null;
+
+  const lower = cleaned.toLowerCase();
+  let intent = "theory";
+  if (/^(compare|contrast|differentiat|distinguish)/i.test(cleaned))
+    intent = "compare";
+  else if (/^(calculate|compute|find|determine|solve|evaluate)/i.test(cleaned))
+    intent = "calculation";
+  else if (/^(design|implement|develop|draw|sketch|construct|apply)/i.test(cleaned))
+    intent = "practical";
+
+  const starters = REFORMULATION_STARTERS[intent] || REFORMULATION_STARTERS.theory;
+
+  // Strip the existing opening verb so we get just the core noun/concept
+  const coreText = cleaned
+    .replace(
+      /^(explain|describe|discuss|outline|state|define|list|compare|contrast|differentiate|distinguish|calculate|compute|find|determine|solve|evaluate|design|implement|develop|draw|sketch|construct|apply|with\s+\S+\sexamples?,\s*explain)\s+/i,
+      "",
+    )
+    .trim();
+
+  const core = coreText || cleaned;
+  const starterFn = starters[index % starters.length];
+  const reformulated = starterFn(core.charAt(0).toLowerCase() + core.slice(1));
+
+  // Ensure it ends with a question mark or full stop
+  return reformulated.match(/[.?!]$/) ? reformulated : `${reformulated}.`;
+}
+
 function generateSuggestedQuestions(
   studyAreas,
   courseQuestions,
   studyAreaPredictions,
 ) {
+  // Group past questions by study area, sorted by occurrence count (most repeated first)
   const groupedQuestions = courseQuestions.reduce((accumulator, question) => {
     const studyAreaName = getStudyAreaName(question);
     accumulator[studyAreaName] = accumulator[studyAreaName] || [];
     accumulator[studyAreaName].push(question);
     return accumulator;
   }, {});
-  const templates = {
-    theory: [
-      (topicName, focus) =>
-        `Explain the main ideas in ${topicName} and show how ${focus} affects exam-style applications.`,
-      (topicName, focus) =>
-        `Discuss the most important principles in ${topicName}, paying attention to ${focus}.`,
-    ],
-    compare: [
-      (topicName, focus) =>
-        `Compare and contrast two major methods in ${topicName}, with attention to ${focus}.`,
-      (topicName, focus) =>
-        `Differentiate key approaches in ${topicName} and explain when ${focus} becomes important.`,
-    ],
-    practical: [
-      (topicName, focus) =>
-        `Design or implement a solution in ${topicName} that clearly demonstrates ${focus}.`,
-      (topicName, focus) =>
-        `Apply ${topicName} in a practical scenario and justify each step using ${focus}.`,
-    ],
-    calculation: [
-      (topicName, focus) =>
-        `Solve a worked problem in ${topicName} and explain each step using ${focus}.`,
-      (topicName, focus) =>
-        `Compute a typical ${topicName} problem and show how ${focus} guides the solution.`,
-    ],
-  };
+
+  // Sort each group: most frequently occurring questions first
+  for (const area of Object.keys(groupedQuestions)) {
+    groupedQuestions[area].sort(
+      (a, b) => (b.occurrenceCount || 1) - (a.occurrenceCount || 1),
+    );
+  }
+
   const generatedQuestions = [];
   const seen = new Set();
+  let reformulationIndex = 0;
 
-  for (const studyAreaPrediction of studyAreaPredictions.slice(0, 5)) {
-    const studyArea = studyAreas.find(
-      (item) => item.id === studyAreaPrediction.topic_id,
-    );
-    const focus = deriveNoteFocus(studyArea?.lecturer_notes || "");
+  for (const studyAreaPrediction of studyAreaPredictions.slice(0, 8)) {
     const relatedQuestions =
       groupedQuestions[studyAreaPrediction.topic_name] || [];
 
-    for (const question of relatedQuestions.slice(0, 5)) {
-      const intent = deriveQuestionIntent(question.text);
-      const intentTemplates = templates[intent] || templates.theory;
-
-      for (const template of intentTemplates) {
-        const generatedText = template(studyAreaPrediction.topic_name, focus);
-
-        if (seen.has(generatedText)) {
-          continue;
-        }
-
-        seen.add(generatedText);
-        generatedQuestions.push({
-          text: generatedText,
-          topicName: studyAreaPrediction.topic_name,
-          questionType: question.questionType || "Theory",
-          difficulty: question.difficulty || "Medium",
-          rationale: `Generated from repeated ${studyAreaPrediction.topic_name} question patterns, course notes, and a study-area probability of ${Math.round(studyAreaPrediction.probability * 100)}%.`,
-          probability: studyAreaPrediction.probability,
-        });
-
-        if (generatedQuestions.length >= 20) {
-          return generatedQuestions.slice(0, 20);
-        }
-      }
-    }
-  }
-
-  if (generatedQuestions.length < 10) {
-    for (const studyAreaPrediction of studyAreaPredictions.slice(0, 5)) {
-      const studyArea = studyAreas.find(
-        (item) => item.id === studyAreaPrediction.topic_id,
+    for (const question of relatedQuestions.slice(0, 4)) {
+      const reformulated = reformulateQuestion(
+        question.text,
+        reformulationIndex++,
       );
-      const focus = deriveNoteFocus(studyArea?.lecturer_notes || "");
-      const fallbackText = `Discuss likely exam issues in ${studyAreaPrediction.topic_name}, focusing on ${focus}.`;
 
-      if (seen.has(fallbackText)) {
-        continue;
-      }
+      if (!reformulated || seen.has(reformulated)) continue;
+      seen.add(reformulated);
 
-      seen.add(fallbackText);
+      const occurrences = question.occurrenceCount || 1;
+      const pct = Math.round(studyAreaPrediction.probability * 100);
+      const yearLabel = question.year ? `${question.year}` : "past year";
+
       generatedQuestions.push({
-        text: fallbackText,
+        text: reformulated,
         topicName: studyAreaPrediction.topic_name,
-        questionType: "Theory",
-        difficulty: "Medium",
-        rationale: `Added because ${studyAreaPrediction.topic_name} is one of the strongest predicted study areas in the current run.`,
+        questionType: question.questionType || "Theory",
+        difficulty: question.difficulty || "Medium",
+        sourceQuestion: question.text,
+        rationale: `Reformulated from a past question (${yearLabel}${occurrences > 1 ? `, appeared ${occurrences}× ` : " "}). ${studyAreaPrediction.topic_name} has a ${pct}% predicted probability of appearing.`,
         probability: studyAreaPrediction.probability,
       });
 
-      if (generatedQuestions.length >= 10) {
-        break;
-      }
+      if (generatedQuestions.length >= 15) return generatedQuestions;
     }
   }
 
-  return generatedQuestions.slice(0, 20);
+  return generatedQuestions.slice(0, 15);
 }
 
 function buildFallbackPredictions(studyAreas, courseQuestions) {
@@ -892,6 +916,7 @@ router.post("/generate", protect, adminOnly, async (req, res) => {
           question: q.question,
           probability: q.probability,
           reasoning: q.reasoning,
+          sourceQuestion: q.sourceQuestion || "",
           appearedInYears: q.appearedInYears || [],
           topic: q.topic,
           questionType: q.questionType,
