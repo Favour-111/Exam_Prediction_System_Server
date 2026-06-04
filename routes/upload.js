@@ -9,6 +9,7 @@ const upload = require("../middleware/upload");
 const { isImageFile } = require("../middleware/upload");
 const Course = require("../models/Course");
 const Question = require("../models/Question");
+const Topic = require("../models/Topic");
 const { protect, adminOnly } = require("../middleware/auth");
 const mongoose = require("mongoose");
 
@@ -88,7 +89,9 @@ const handleUploadFiles = (req, res, next) => {
 };
 
 // Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, "..", "uploads");
+const uploadsDir = process.env.VERCEL
+  ? path.join("/tmp", "uploads")
+  : path.join(__dirname, "..", "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
